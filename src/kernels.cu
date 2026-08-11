@@ -22,7 +22,7 @@
  * @param[in] eps Numerical stability epsilon.
  */
 
-// half 累加不稳，中间都走 float
+// half 在累加时精度不够，统一转 float 再算
 template <typename T>
 __device__ __forceinline__ float loadAsFloat(T v);
 
@@ -49,7 +49,7 @@ __device__ __forceinline__ half storeFromFloat<half>(float v) {
   return __float2half(v);
 }
 
-// 缓冲不够再扩，够就接着用，少打 malloc
+// 显存按需扩容，避免反复 malloc
 template <typename T>
 void ensureDeviceBuffer(T*& ptr, size_t& capacity_bytes, size_t need_bytes) {
   if (need_bytes <= capacity_bytes) {
@@ -63,8 +63,7 @@ void ensureDeviceBuffer(T*& ptr, size_t& capacity_bytes, size_t need_bytes) {
   capacity_bytes = need_bytes;
 }
 
-// 一行一个 block，先各自加 x^2，再归约成 inv_rms
-// 天数 warp=64，不能写死 32；天数走 shared 树归约，NVIDIA 仍用 shuffle
+// 一行一个 block：先规约 sum(x^2)，再写归一化结果
 template <typename T>
 __global__ void rmsNormKernel(const T* input, const T* weight, T* output,
                               size_t hidden_dim, float eps) {
@@ -82,7 +81,6 @@ __global__ void rmsNormKernel(const T* input, const T* weight, T* output,
   }
 
 #if defined(PLATFORM_ILUVATAR)
-  // 天数：warp 64，用 shared 归约更稳
   __shared__ float shared_sum[kBlockSize];
   shared_sum[tid] = partial;
   __syncthreads();
@@ -97,7 +95,7 @@ __global__ void rmsNormKernel(const T* input, const T* weight, T* output,
   }
   __syncthreads();
 #else
-  // NVIDIA：warp 32，shuffle 收拢
+  // warp 内 shuffle 规约，再汇总到 shared memory
   __shared__ float warp_sums[kBlockSize / 32];
   const unsigned int lane = tid & 31;
   const unsigned int warp_id = tid >> 5;
@@ -137,7 +135,7 @@ void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
     return;
   }
 
-  // 跨调用复用显存，测例连跑时省一点时间
+  // 静态缓冲跨调用复用
   static T* d_input = nullptr;
   static T* d_weight = nullptr;
   static T* d_output = nullptr;
@@ -182,7 +180,7 @@ void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
  * @param[in] is_causal Whether to apply causal masking
  */
 
-// Br 行 Q 共用一块 K/V tile；先扫一遍拿 max，再算 softmax，数值比较稳
+// FlashAttention：按 Br×Bc 分块；先找 max，再算 softmax 加权
 constexpr int kFlashBr = 8;
 constexpr int kFlashBc = 16;
 
@@ -191,7 +189,7 @@ __device__ __forceinline__ float dotQK(const float* q, const float* k,
                                        int head_dim) {
   float score = 0.0f;
   int d = 0;
-  // 每次啃 4 维，尾巴再慢慢加
+  // 4 路展开点积
   for (; d + 3 < head_dim; d += 4) {
     score += q[d] * k[d];
     score += q[d + 1] * k[d + 1];
@@ -230,11 +228,11 @@ __global__ void flashAttentionKernel(const T* Q, const T* K, const T* V, T* O,
   const int q_rows = min(kFlashBr, target_seq_len - q_start);
   const int q_last = q_start + q_rows - 1;
 
-  // GQA：几个 query head 盯同一组 kv
+  // GQA：多个 query head 共用一组 K/V
   const int hkv = hq / (query_heads / kv_heads);
   const float scale = rsqrtf(static_cast<float>(head_dim));
 
-  // 把这几行 Q 搬进来，输出先清零
+  // 加载本 tile 的 Q，并清零输出累加
   for (int idx = tid; idx < q_rows * head_dim; idx += blockDim.x) {
     const int r = idx / head_dim;
     const int d = idx % head_dim;
@@ -250,9 +248,9 @@ __global__ void flashAttentionKernel(const T* Q, const T* K, const T* V, T* O,
   }
   __syncthreads();
 
-  // 第一遍：只关心每行 score 的最大值
+  // Pass 1：扫 max(score)
   for (int k0 = 0; k0 < src_seq_len; k0 += kFlashBc) {
-    // causal 时后面的 key 整块都看不见，可以直接停
+    // causal：整块 key 已不可见则提前结束
     if (is_causal && k0 > q_last) {
       break;
     }
@@ -294,7 +292,7 @@ __global__ void flashAttentionKernel(const T* Q, const T* K, const T* V, T* O,
     __syncthreads();
   }
 
-  // 第二遍：用上面的 max 做 softmax，再加权 V
+  // Pass 2：softmax + 累加 V
   for (int k0 = 0; k0 < src_seq_len; k0 += kFlashBc) {
     if (is_causal && k0 > q_last) {
       break;
@@ -378,7 +376,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     return;
   }
 
-  // 和 rmsNorm 一样，显存留下来反复用
+  // 静态缓冲跨调用复用
   static T* d_q = nullptr;
   static T* d_k = nullptr;
   static T* d_v = nullptr;
@@ -411,7 +409,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                           kFlashBr * kFlashBc + kFlashBr + kFlashBr) *
       sizeof(float);
 
-  // 每个 block 吃 Br 行 query
+  // 每个 block 处理 Br 行 query
   dim3 block(128);
   dim3 grid((target_seq_len + kFlashBr - 1) / kFlashBr, query_heads,
             batch_size);

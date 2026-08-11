@@ -3,7 +3,7 @@
 
 #include "../tester/utils.h"
 
-// half 累加不稳，中间都走 float
+// half 在累加时精度不够，统一转 float 再算
 template <typename T>
 __device__ __forceinline__ float loadAsFloat(T v);
 
@@ -30,7 +30,7 @@ __device__ __forceinline__ half storeFromFloat<half>(float v) {
   return __float2half(v);
 }
 
-// 缓冲不够再扩，够就接着用，少打 malloc
+// 显存按需扩容，避免反复 malloc
 template <typename T>
 void ensureDeviceBuffer(T*& ptr, size_t& capacity_bytes, size_t need_bytes) {
   if (need_bytes <= capacity_bytes) {
@@ -44,8 +44,7 @@ void ensureDeviceBuffer(T*& ptr, size_t& capacity_bytes, size_t need_bytes) {
   capacity_bytes = need_bytes;
 }
 
-// 一行一个 block，先各自加 x^2，再归约成 inv_rms
-// 摩尔线程 warp=32，走 shuffle 归约
+// 一行一个 block：先规约 sum(x^2)，再写归一化结果
 template <typename T>
 __global__ void rmsNormKernel(const T* input, const T* weight, T* output,
                               size_t hidden_dim, float eps) {
@@ -62,7 +61,7 @@ __global__ void rmsNormKernel(const T* input, const T* weight, T* output,
     partial += x * x;
   }
 
-  // warp 32，shuffle 收拢
+  // warp 内 shuffle 规约，再汇总到 shared memory
   __shared__ float warp_sums[kBlockSize / 32];
   const unsigned int lane = tid & 31;
   const unsigned int warp_id = tid >> 5;
@@ -101,7 +100,7 @@ void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
     return;
   }
 
-  // 跨调用复用显存，测例连跑时省一点时间
+  // 静态缓冲跨调用复用
   static T* d_input = nullptr;
   static T* d_weight = nullptr;
   static T* d_output = nullptr;
@@ -129,7 +128,7 @@ void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
                            musaMemcpyDeviceToHost));
 }
 
-// Br 行 Q 共用一块 K/V tile；先扫一遍拿 max，再算 softmax，数值比较稳
+// FlashAttention：按 Br×Bc 分块；先找 max，再算 softmax 加权
 constexpr int kFlashBr = 8;
 constexpr int kFlashBc = 16;
 
@@ -138,7 +137,7 @@ __device__ __forceinline__ float dotQK(const float* q, const float* k,
                                        int head_dim) {
   float score = 0.0f;
   int d = 0;
-  // 每次啃 4 维，尾巴再慢慢加
+  // 4 路展开点积
   for (; d + 3 < head_dim; d += 4) {
     score += q[d] * k[d];
     score += q[d + 1] * k[d + 1];
@@ -151,7 +150,6 @@ __device__ __forceinline__ float dotQK(const float* q, const float* k,
   return score;
 }
 
-// 通用版本：sO 用 float，sL 用 float（half 走这个）
 template <typename T>
 __global__ void flashAttentionKernel(const T* Q, const T* K, const T* V, T* O,
                                      int target_seq_len, int src_seq_len,
@@ -313,7 +311,7 @@ __global__ void flashAttentionKernel(const T* Q, const T* K, const T* V, T* O,
   }
 }
 
-// float 特化：sO 和 sL 都用 double，提升长序列精度
+// float：sO/sL 用 double 累加，避免长序列误差超容差
 template <>
 __global__ void flashAttentionKernel<float>(const float* Q, const float* K, const float* V, float* O,
                                      int target_seq_len, int src_seq_len,
@@ -444,7 +442,6 @@ __global__ void flashAttentionKernel<float>(const float* Q, const float* K, cons
       sL[tid] = l;
     }
 
-    // double 累加 sO
     for (int idx = tid; idx < q_rows * head_dim; idx += blockDim.x) {
       const int r = idx / head_dim;
       const int d = idx % head_dim;
@@ -513,7 +510,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
   RUNTIME_CHECK(musaMemcpy(d_v, h_v.data(), kv_elems * sizeof(T),
                            musaMemcpyHostToDevice));
 
-  // float 版本 sO 和 sL 用 double，smem 更大
+  // float 路径 sO/sL 为 double，shared memory 更大
   const size_t sO_bytes = (std::is_same<T, float>::value)
                               ? kFlashBr * head_dim * sizeof(double)
                               : kFlashBr * head_dim * sizeof(float);
