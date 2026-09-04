@@ -122,3 +122,8 @@ compute-sanitizer --tool memcheck --error-exitcode 99 ./build/unit_tests
 本轮 CTest 7/7 通过，`compute-sanitizer` 报告 0 errors。Nsight Systems 的
 Exact K10 代表性采样显示 fused 距离+局部 Top-K kernel 占 GPU kernel 时间
 约 99.9%；文本摘要已入库，原始 `.nsys-rep` 因体积和机器相关性不提交。
+
+新增评测字段和两处样本数日志上传后，GPU 端已再次完成增量编译，CTest 仍为
+7/7。新版 IVF 和 FAISS 脚本分别完成百万数据 smoke test，确认训练元数据、
+run/batch 样本数与平均/最大分数误差均能写入 CSV；对应日志文件名包含
+`after_instrumentation`。
